@@ -11348,29 +11348,28 @@ static JSBigInt *js_bigint_normalize1(JSContext *ctx, JSBigInt *a, int l)
     return a;
 }
 
-static JSBigInt *js_bigint_normalize(JSContext *ctx, JSBigInt *a)
+static JSBigInt *js_bigint_normalize(JSContext *ctx, JSBigInt *value)
 {
-    return js_bigint_normalize1(ctx, a, a->len);
+    return js_bigint_normalize1(ctx, value, value->len);
 }
 
-/* return 0 or 1 depending on the sign */
-static inline int js_bigint_sign(const JSBigInt *a)
+static inline int js_bigint_sign(const JSBigInt *value)
 {
-    return a->tab[a->len - 1] >> (JS_LIMB_BITS - 1);
+    return value->tab[value->len - 1] >> (JS_LIMB_BITS - 1);
 }
 
-static js_slimb_t js_bigint_get_si_sat(const JSBigInt *a)
+static js_slimb_t js_bigint_get_si_sat(const JSBigInt *value)
 {
-    if (a->len == 1) {
-        return a->tab[0];
+    if (value->len == 1) {
+        return value->tab[0];
     } else {
 #if JS_LIMB_BITS == 32
-        if (js_bigint_sign(a))
+        if (js_bigint_sign(value))
             return INT32_MIN;
         else
             return INT32_MAX;
 #else
-        if (js_bigint_sign(a))
+        if (js_bigint_sign(value))
             return INT64_MIN;
         else
             return INT64_MAX;
@@ -11378,635 +11377,1142 @@ static js_slimb_t js_bigint_get_si_sat(const JSBigInt *a)
     }
 }
 
-/* add the op1 limb */
-static JSBigInt *js_bigint_extend(JSContext *ctx, JSBigInt *r,
-                                  js_limb_t op1)
+static JSBigInt *js_bigint_extend(JSContext *ctx, JSBigInt *result,
+                                  js_limb_t extra_limb)
 {
-    int n2 = r->len;
-    if ((op1 != 0 && op1 != -1) ||
-        (op1 & 1) != r->tab[n2 - 1] >> (JS_LIMB_BITS - 1)) {
-        JSBigInt *r1;
-        r1 = js_realloc(ctx, r,
-                        sizeof(JSBigInt) + (n2 + 1) * sizeof(js_limb_t));
-        if (!r1) {
-            js_free(ctx, r);
+    int old_len = result->len;
+
+    if ((extra_limb != 0 && extra_limb != -1) ||
+        (extra_limb & 1) !=
+            result->tab[old_len - 1] >> (JS_LIMB_BITS - 1)) {
+        JSBigInt *new_result;
+
+        new_result = js_realloc(
+            ctx,
+            result,
+            sizeof(JSBigInt) + (old_len + 1) * sizeof(js_limb_t)
+        );
+
+        if (!new_result) {
+            js_free(ctx, result);
             return NULL;
         }
-        r = r1;
-        r->len = n2 + 1;
-        r->tab[n2] = op1;
+
+        result = new_result;
+        result->len = old_len + 1;
+        result->tab[old_len] = extra_limb;
     } else {
-        /* otherwise still need to normalize the result */
-        r = js_bigint_normalize(ctx, r);
+        result = js_bigint_normalize(ctx, result);
     }
-    return r;
+
+    return result;
 }
 
-/* return NULL in case of error. Compute a + b (b_neg = 0) or a - b
-   (b_neg = 1) */
-/* XXX: optimize */
-static JSBigInt *js_bigint_add(JSContext *ctx, const JSBigInt *a,
-                               const JSBigInt *b, int b_neg)
+static JSBigInt *js_bigint_add(JSContext *ctx,
+                               const JSBigInt *lhs,
+                               const JSBigInt *rhs,
+                               int rhs_neg)
 {
-    JSBigInt *r;
-    int n1, n2, i;
-    js_limb_t carry, op1, op2, a_sign, b_sign;
-    
-    n2 = max_int(a->len, b->len);
-    n1 = min_int(a->len, b->len);
-    r = js_bigint_new(ctx, n2);
-    if (!r)
+    JSBigInt *result;
+    int common_len;
+    int result_len;
+    int idx;
+    js_limb_t carry;
+    js_limb_t lhs_limb;
+    js_limb_t rhs_limb;
+    js_limb_t lhs_sign;
+    js_limb_t rhs_sign;
+
+    result_len = max_int(lhs->len, rhs->len);
+    common_len = min_int(lhs->len, rhs->len);
+
+    result = js_bigint_new(ctx, result_len);
+
+    if (!result)
         return NULL;
-    /* XXX: optimize */
-    /* common part */
-    carry = b_neg;
-    for(i = 0; i < n1; i++) {
-        op1 = a->tab[i];
-        op2 = b->tab[i] ^ (-b_neg);
-        ADDC(r->tab[i], carry, op1, op2, carry);
-    }
-    a_sign = -js_bigint_sign(a);
-    b_sign = (-js_bigint_sign(b)) ^ (-b_neg);
-    /* part with sign extension of one operand  */
-    if (a->len > b->len) {
-        for(i = n1; i < n2; i++) {
-            op1 = a->tab[i];
-            ADDC(r->tab[i], carry, op1, b_sign, carry);
-        }
-    } else if (a->len < b->len) {
-        for(i = n1; i < n2; i++) {
-            op2 = b->tab[i] ^ (-b_neg);
-            ADDC(r->tab[i], carry, a_sign, op2, carry);
-        }
+
+    carry = rhs_neg;
+
+    for (idx = 0; idx < common_len; idx++) {
+        lhs_limb = lhs->tab[idx];
+        rhs_limb = rhs->tab[idx] ^ (-rhs_neg);
+
+        ADDC(
+            result->tab[idx],
+            carry,
+            lhs_limb,
+            rhs_limb,
+            carry
+        );
     }
 
-    /* part with sign extension for both operands. Extend the result
-       if necessary */
-    return js_bigint_extend(ctx, r, a_sign + b_sign + carry);
+    lhs_sign = -js_bigint_sign(lhs);
+    rhs_sign = (-js_bigint_sign(rhs)) ^ (-rhs_neg);
+
+    if (lhs->len > rhs->len) {
+        for (idx = common_len; idx < result_len; idx++) {
+            lhs_limb = lhs->tab[idx];
+
+            ADDC(
+                result->tab[idx],
+                carry,
+                lhs_limb,
+                rhs_sign,
+                carry
+            );
+        }
+    } else if (lhs->len < rhs->len) {
+        for (idx = common_len; idx < result_len; idx++) {
+            rhs_limb = rhs->tab[idx] ^ (-rhs_neg);
+
+            ADDC(
+                result->tab[idx],
+                carry,
+                lhs_sign,
+                rhs_limb,
+                carry
+            );
+        }
+    }
+
+    return js_bigint_extend(
+        ctx,
+        result,
+        lhs_sign + rhs_sign + carry
+    );
 }
 
-/* XXX: optimize */
-static JSBigInt *js_bigint_neg(JSContext *ctx, const JSBigInt *a)
+static JSBigInt *js_bigint_neg(JSContext *ctx, const JSBigInt *value)
 {
-    JSBigIntBuf buf;
-    JSBigInt *b;
-    b = js_bigint_set_si(&buf, 0);
-    return js_bigint_add(ctx, b, a, 1);
+    JSBigIntBuf zero_buffer;
+    JSBigInt *zero_value;
+
+    zero_value = js_bigint_set_si(&zero_buffer, 0);
+
+    return js_bigint_add(ctx, zero_value, value, 1);
 }
 
-static JSBigInt *js_bigint_mul(JSContext *ctx, const JSBigInt *a,
-                               const JSBigInt *b)
+static JSBigInt *js_bigint_mul(JSContext *ctx,
+                               const JSBigInt *lhs,
+                               const JSBigInt *rhs)
 {
-    JSBigInt *r;
-    
-    r = js_bigint_new(ctx, a->len + b->len);
-    if (!r)
+    JSBigInt *result;
+
+    result = js_bigint_new(ctx, lhs->len + rhs->len);
+
+    if (!result)
         return NULL;
-    mp_mul_basecase(r->tab, a->tab, a->len, b->tab, b->len);
-    /* correct the result if negative operands (no overflow is
-       possible) */
-    if (js_bigint_sign(a))
-        mp_sub(r->tab + a->len, r->tab + a->len, b->tab, b->len, 0);
-    if (js_bigint_sign(b))
-        mp_sub(r->tab + b->len, r->tab + b->len, a->tab, a->len, 0);
-    return js_bigint_normalize(ctx, r);
+
+    mp_mul_basecase(
+        result->tab,
+        lhs->tab,
+        lhs->len,
+        rhs->tab,
+        rhs->len
+    );
+
+    if (js_bigint_sign(lhs)) {
+        mp_sub(
+            result->tab + lhs->len,
+            result->tab + lhs->len,
+            rhs->tab,
+            rhs->len,
+            0
+        );
+    }
+
+    if (js_bigint_sign(rhs)) {
+        mp_sub(
+            result->tab + rhs->len,
+            result->tab + rhs->len,
+            lhs->tab,
+            lhs->len,
+            0
+        );
+    }
+
+    return js_bigint_normalize(ctx, result);
 }
 
-/* return the division or the remainder. 'b' must be != 0. return NULL
-   in case of exception (division by zero or memory error) */
-static JSBigInt *js_bigint_divrem(JSContext *ctx, const JSBigInt *a,
-                                  const JSBigInt *b, BOOL is_rem)
+static JSBigInt *js_bigint_divrem(JSContext *ctx,
+                                  const JSBigInt *lhs,
+                                  const JSBigInt *rhs,
+                                  BOOL want_remainder)
 {
-    JSBigInt *r, *q;
-    js_limb_t *tabb, h;
-    int na, nb, a_sign, b_sign, shift;
-    
-    if (b->len == 1 && b->tab[0] == 0) {
+    JSBigInt *remainder;
+    JSBigInt *quotient;
+    js_limb_t *divisor_tab;
+    js_limb_t high_limb;
+    int lhs_len;
+    int rhs_len;
+    int lhs_sign;
+    int rhs_sign;
+    int norm_shift;
+
+    if (rhs->len == 1 && rhs->tab[0] == 0) {
         JS_ThrowRangeError(ctx, "BigInt division by zero");
         return NULL;
     }
-    
-    a_sign = js_bigint_sign(a);
-    b_sign = js_bigint_sign(b);
-    na = a->len;
-    nb = b->len;
 
-    r = js_bigint_new(ctx, na + 2); 
-    if (!r)
+    lhs_sign = js_bigint_sign(lhs);
+    rhs_sign = js_bigint_sign(rhs);
+
+    lhs_len = lhs->len;
+    rhs_len = rhs->len;
+
+    remainder = js_bigint_new(ctx, lhs_len + 2);
+
+    if (!remainder)
         return NULL;
-    if (a_sign) {
-        mp_neg(r->tab, a->tab, na);
-    } else {
-        memcpy(r->tab, a->tab, na * sizeof(a->tab[0]));
-    }
-    /* normalize */
-    while (na > 1 && r->tab[na - 1] == 0)
-        na--;
 
-    tabb = js_malloc(ctx, nb * sizeof(tabb[0]));
-    if (!tabb) {
-        js_free(ctx, r);
+    if (lhs_sign) {
+        mp_neg(
+            remainder->tab,
+            lhs->tab,
+            lhs_len
+        );
+    } else {
+        memcpy(
+            remainder->tab,
+            lhs->tab,
+            lhs_len * sizeof(lhs->tab[0])
+        );
+    }
+
+    while (lhs_len > 1 &&
+           remainder->tab[lhs_len - 1] == 0) {
+        lhs_len--;
+    }
+
+    divisor_tab = js_malloc(
+        ctx,
+        rhs_len * sizeof(divisor_tab[0])
+    );
+
+    if (!divisor_tab) {
+        js_free(ctx, remainder);
         return NULL;
     }
-    if (b_sign) {
-        mp_neg(tabb, b->tab, nb);
-    } else {
-        memcpy(tabb, b->tab, nb * sizeof(tabb[0]));
-    }
-    /* normalize */
-    while (nb > 1 && tabb[nb - 1] == 0)
-        nb--;
 
-    /* trivial case if 'a' is small */
-    if (na < nb) {
-        js_free(ctx, r);
-        js_free(ctx, tabb);
-        if (is_rem) {
-            /* r = a */
-            r = js_bigint_new(ctx, a->len);
-            if (!r)
+    if (rhs_sign) {
+        mp_neg(
+            divisor_tab,
+            rhs->tab,
+            rhs_len
+        );
+    } else {
+        memcpy(
+            divisor_tab,
+            rhs->tab,
+            rhs_len * sizeof(divisor_tab[0])
+        );
+    }
+
+    while (rhs_len > 1 &&
+           divisor_tab[rhs_len - 1] == 0) {
+        rhs_len--;
+    }
+
+    if (lhs_len < rhs_len) {
+        js_free(ctx, remainder);
+        js_free(ctx, divisor_tab);
+
+        if (want_remainder) {
+            remainder = js_bigint_new(ctx, lhs->len);
+
+            if (!remainder)
                 return NULL;
-            memcpy(r->tab, a->tab, a->len * sizeof(a->tab[0])); 
-            return r;
+
+            memcpy(
+                remainder->tab,
+                lhs->tab,
+                lhs->len * sizeof(lhs->tab[0])
+            );
+
+            return remainder;
         } else {
-            /* q = 0 */
             return js_bigint_new_si(ctx, 0);
         }
     }
 
-    /* normalize 'b' */
-    shift = js_limb_clz(tabb[nb - 1]);
-    if (shift != 0) {
-        mp_shl(tabb, tabb, nb, shift);
-        h = mp_shl(r->tab, r->tab, na, shift);
-        if (h != 0)
-            r->tab[na++] = h;
+    norm_shift = js_limb_clz(
+        divisor_tab[rhs_len - 1]
+    );
+
+    if (norm_shift != 0) {
+        mp_shl(
+            divisor_tab,
+            divisor_tab,
+            rhs_len,
+            norm_shift
+        );
+
+        high_limb = mp_shl(
+            remainder->tab,
+            remainder->tab,
+            lhs_len,
+            norm_shift
+        );
+
+        if (high_limb != 0) {
+            remainder->tab[lhs_len++] = high_limb;
+        }
     }
 
-    q = js_bigint_new(ctx, na - nb + 2); /* one more limb for the sign */
-    if (!q) {
-        js_free(ctx, r);
-        js_free(ctx, tabb);
+    quotient = js_bigint_new(
+        ctx,
+        lhs_len - rhs_len + 2
+    );
+
+    if (!quotient) {
+        js_free(ctx, remainder);
+        js_free(ctx, divisor_tab);
         return NULL;
     }
 
-    //    js_bigint_dump1(ctx, "a", r->tab, na);
-    //    js_bigint_dump1(ctx, "b", tabb, nb);
-    mp_divnorm(q->tab, r->tab, na, tabb, nb);
-    js_free(ctx, tabb);
+    mp_divnorm(
+        quotient->tab,
+        remainder->tab,
+        lhs_len,
+        divisor_tab,
+        rhs_len
+    );
 
-    if (is_rem) {
-        js_free(ctx, q);
-        if (shift != 0)
-            mp_shr(r->tab, r->tab, nb, shift, 0);
-        r->tab[nb++] = 0;
-        if (a_sign)
-            mp_neg(r->tab, r->tab, nb);
-        r = js_bigint_normalize1(ctx, r, nb);
-        return r;
-    } else {
-        js_free(ctx, r);
-        q->tab[na - nb + 1] = 0;
-        if (a_sign ^ b_sign) {
-            mp_neg(q->tab, q->tab, q->len);
+    js_free(ctx, divisor_tab);
+
+    if (want_remainder) {
+        js_free(ctx, quotient);
+
+        if (norm_shift != 0) {
+            mp_shr(
+                remainder->tab,
+                remainder->tab,
+                rhs_len,
+                norm_shift,
+                0
+            );
         }
-        q = js_bigint_normalize(ctx, q);
-        return q;
+
+        remainder->tab[rhs_len++] = 0;
+
+        if (lhs_sign) {
+            mp_neg(
+                remainder->tab,
+                remainder->tab,
+                rhs_len
+            );
+        }
+
+        remainder = js_bigint_normalize1(
+            ctx,
+            remainder,
+            rhs_len
+        );
+
+        return remainder;
+    } else {
+        js_free(ctx, remainder);
+
+        quotient->tab[lhs_len - rhs_len + 1] = 0;
+
+        if (lhs_sign ^ rhs_sign) {
+            mp_neg(
+                quotient->tab,
+                quotient->tab,
+                quotient->len
+            );
+        }
+
+        quotient = js_bigint_normalize(
+            ctx,
+            quotient
+        );
+
+        return quotient;
     }
 }
 
-/* and, or, xor */
-static JSBigInt *js_bigint_logic(JSContext *ctx, const JSBigInt *a,
-                                 const JSBigInt *b, OPCodeEnum op)
+static JSBigInt *js_bigint_logic(JSContext *ctx,
+                                 const JSBigInt *lhs,
+                                 const JSBigInt *rhs,
+                                 OPCodeEnum operation)
 {
-    JSBigInt *r;
-    js_limb_t b_sign;
-    int a_len, b_len, i;
+    JSBigInt *result;
+    js_limb_t rhs_sign;
+    int lhs_len;
+    int rhs_len;
+    int idx;
 
-    if (a->len < b->len) {
-        const JSBigInt *tmp;
-        tmp = a;
-        a = b;
-        b = tmp;
+    if (lhs->len < rhs->len) {
+        const JSBigInt *swap_value;
+
+        swap_value = lhs;
+        lhs = rhs;
+        rhs = swap_value;
     }
-    /* a_len >= b_len */
-    a_len = a->len;
-    b_len = b->len;
-    b_sign = -js_bigint_sign(b);
 
-    r = js_bigint_new(ctx, a_len);
-    if (!r)
+    lhs_len = lhs->len;
+    rhs_len = rhs->len;
+
+    rhs_sign = -js_bigint_sign(rhs);
+
+    result = js_bigint_new(ctx, lhs_len);
+
+    if (!result)
         return NULL;
-    switch(op) {
+
+    switch (operation) {
     case OP_or:
-        for(i = 0; i < b_len; i++) {
-            r->tab[i] = a->tab[i] | b->tab[i];
+        for (idx = 0; idx < rhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] | rhs->tab[idx];
         }
-        for(i = b_len; i < a_len; i++) {
-            r->tab[i] = a->tab[i] | b_sign;
+
+        for (idx = rhs_len; idx < lhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] | rhs_sign;
         }
+
         break;
+
     case OP_and:
-        for(i = 0; i < b_len; i++) {
-            r->tab[i] = a->tab[i] & b->tab[i];
+        for (idx = 0; idx < rhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] & rhs->tab[idx];
         }
-        for(i = b_len; i < a_len; i++) {
-            r->tab[i] = a->tab[i] & b_sign;
+
+        for (idx = rhs_len; idx < lhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] & rhs_sign;
         }
+
         break;
+
     case OP_xor:
-        for(i = 0; i < b_len; i++) {
-            r->tab[i] = a->tab[i] ^ b->tab[i];
+        for (idx = 0; idx < rhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] ^ rhs->tab[idx];
         }
-        for(i = b_len; i < a_len; i++) {
-            r->tab[i] = a->tab[i] ^ b_sign;
+
+        for (idx = rhs_len; idx < lhs_len; idx++) {
+            result->tab[idx] =
+                lhs->tab[idx] ^ rhs_sign;
         }
+
         break;
+
     default:
         abort();
     }
-    return js_bigint_normalize(ctx, r);
+
+    return js_bigint_normalize(ctx, result);
 }
 
-static JSBigInt *js_bigint_not(JSContext *ctx, const JSBigInt *a)
+static JSBigInt *js_bigint_not(JSContext *ctx,
+                               const JSBigInt *value)
 {
-    JSBigInt *r;
-    int i;
-    
-    r = js_bigint_new(ctx, a->len);
-    if (!r)
+    JSBigInt *result;
+    int idx;
+
+    result = js_bigint_new(ctx, value->len);
+
+    if (!result)
         return NULL;
-    for(i = 0; i < a->len; i++) {
-        r->tab[i] = ~a->tab[i];
+
+    for (idx = 0; idx < value->len; idx++) {
+        result->tab[idx] = ~value->tab[idx];
     }
-    /* no normalization is needed */
-    return r;
+
+    return result;
 }
 
-static JSBigInt *js_bigint_shl(JSContext *ctx, const JSBigInt *a,
-                               unsigned int shift1)
+static JSBigInt *js_bigint_shl(JSContext *ctx,
+                               const JSBigInt *value,
+                               unsigned int shift_amount)
 {
-    int d, i, shift;
-    JSBigInt *r;
-    js_limb_t l;
+    int limb_offset;
+    int idx;
+    int bit_shift;
+    JSBigInt *result;
+    js_limb_t upper_limb;
 
-    if (a->len == 1 && a->tab[0] == 0)
-        return js_bigint_new_si(ctx, 0); /* zero case */
-    d = shift1 / JS_LIMB_BITS;
-    shift = shift1 % JS_LIMB_BITS;
-    r = js_bigint_new(ctx, a->len + d);
-    if (!r)
+    if (value->len == 1 &&
+        value->tab[0] == 0) {
+        return js_bigint_new_si(ctx, 0);
+    }
+
+    limb_offset = shift_amount / JS_LIMB_BITS;
+    bit_shift = shift_amount % JS_LIMB_BITS;
+
+    result = js_bigint_new(
+        ctx,
+        value->len + limb_offset
+    );
+
+    if (!result)
         return NULL;
-    for(i = 0; i < d; i++)
-        r->tab[i] = 0;
-    if (shift == 0) {
-        for(i = 0; i < a->len; i++) {
-            r->tab[i + d] = a->tab[i];
+
+    for (idx = 0; idx < limb_offset; idx++) {
+        result->tab[idx] = 0;
+    }
+
+    if (bit_shift == 0) {
+        for (idx = 0; idx < value->len; idx++) {
+            result->tab[idx + limb_offset] =
+                value->tab[idx];
         }
     } else {
-        l = mp_shl(r->tab + d, a->tab, a->len, shift);
-        if (js_bigint_sign(a))
-            l |= (js_limb_t)(-1) << shift;
-        r = js_bigint_extend(ctx, r, l);
-    }
-    return r;
-}
+        upper_limb = mp_shl(
+            result->tab + limb_offset,
+            value->tab,
+            value->len,
+            bit_shift
+        );
 
-static JSBigInt *js_bigint_shr(JSContext *ctx, const JSBigInt *a,
-                               unsigned int shift1)
-{
-    int d, i, shift, a_sign, n1;
-    JSBigInt *r;
-
-    d = shift1 / JS_LIMB_BITS;
-    shift = shift1 % JS_LIMB_BITS;
-    a_sign = js_bigint_sign(a);
-    if (d >= a->len)
-        return js_bigint_new_si(ctx, -a_sign);
-    n1 = a->len - d;
-    r = js_bigint_new(ctx, n1);
-    if (!r)
-        return NULL;
-    if (shift == 0) {
-        for(i = 0; i < n1; i++) {
-            r->tab[i] = a->tab[i + d];
+        if (js_bigint_sign(value)) {
+            upper_limb |=
+                (js_limb_t)(-1) << bit_shift;
         }
-        /* no normalization is needed */
-    } else {
-        mp_shr(r->tab, a->tab + d, n1, shift, -a_sign);
-        r = js_bigint_normalize(ctx, r);
+
+        result = js_bigint_extend(
+            ctx,
+            result,
+            upper_limb
+        );
     }
-    return r;
+
+    return result;
 }
 
-static JSBigInt *js_bigint_pow(JSContext *ctx, const JSBigInt *a, JSBigInt *b)
+static JSBigInt *js_bigint_shr(JSContext *ctx,
+                               const JSBigInt *value,
+                               unsigned int shift_amount)
 {
-    uint32_t e;
-    int n_bits, i;
-    JSBigInt *r, *r1;
-    
-    /* b must be >= 0 */
-    if (js_bigint_sign(b)) {
-        JS_ThrowRangeError(ctx, "BigInt negative exponent");
+    int limb_offset;
+    int idx;
+    int bit_shift;
+    int value_sign;
+    int result_len;
+    JSBigInt *result;
+
+    limb_offset = shift_amount / JS_LIMB_BITS;
+    bit_shift = shift_amount % JS_LIMB_BITS;
+
+    value_sign = js_bigint_sign(value);
+
+    if (limb_offset >= value->len) {
+        return js_bigint_new_si(
+            ctx,
+            -value_sign
+        );
+    }
+
+    result_len = value->len - limb_offset;
+
+    result = js_bigint_new(
+        ctx,
+        result_len
+    );
+
+    if (!result)
+        return NULL;
+
+    if (bit_shift == 0) {
+        for (idx = 0; idx < result_len; idx++) {
+            result->tab[idx] =
+                value->tab[idx + limb_offset];
+        }
+    } else {
+        mp_shr(
+            result->tab,
+            value->tab + limb_offset,
+            result_len,
+            bit_shift,
+            -value_sign
+        );
+
+        result = js_bigint_normalize(
+            ctx,
+            result
+        );
+    }
+
+    return result;
+}
+
+static JSBigInt *js_bigint_pow(JSContext *ctx,
+                               const JSBigInt *base,
+                               JSBigInt *exponent)
+{
+    uint32_t exponent_value;
+    int bit_count;
+    int bit_index;
+    JSBigInt *result;
+    JSBigInt *next_result;
+
+    if (js_bigint_sign(exponent)) {
+        JS_ThrowRangeError(
+            ctx,
+            "BigInt negative exponent"
+        );
         return NULL;
     }
-    if (b->len == 1 && b->tab[0] == 0) {
-        /* a^0 = 1 */
+
+    if (exponent->len == 1 &&
+        exponent->tab[0] == 0) {
         return js_bigint_new_si(ctx, 1);
-    } else if (a->len == 1) {
-        js_limb_t v;
-        BOOL is_neg;
+    } else if (base->len == 1) {
+        js_limb_t base_value;
+        BOOL base_is_negative;
 
-        v = a->tab[0];
-        if (v <= 1)
-            return js_bigint_new_si(ctx, v);
-        else if (v == -1)
-            return js_bigint_new_si(ctx, 1 - 2 * (b->tab[0] & 1));
-        is_neg = (js_slimb_t)v < 0;
-        if (is_neg)
-            v = -v;
-        if ((v & (v - 1)) == 0) {
-            uint64_t e1;
-            int n;
-            /* v = 2^n */
-            n = JS_LIMB_BITS - 1 - js_limb_clz(v);
-            if (b->len > 1)
+        base_value = base->tab[0];
+
+        if (base_value <= 1) {
+            return js_bigint_new_si(
+                ctx,
+                base_value
+            );
+        } else if (base_value == -1) {
+            return js_bigint_new_si(
+                ctx,
+                1 - 2 * (exponent->tab[0] & 1)
+            );
+        }
+
+        base_is_negative =
+            (js_slimb_t)base_value < 0;
+
+        if (base_is_negative) {
+            base_value = -base_value;
+        }
+
+        if ((base_value & (base_value - 1)) == 0) {
+            uint64_t total_shift;
+            int log_value;
+
+            log_value =
+                JS_LIMB_BITS - 1 -
+                js_limb_clz(base_value);
+
+            if (exponent->len > 1)
                 goto overflow;
-            if (b->tab[0] > INT32_MAX)
+
+            if (exponent->tab[0] > INT32_MAX)
                 goto overflow;
-            e = b->tab[0];
-            e1 = (uint64_t)e * n;
-            if (e1 > JS_BIGINT_MAX_SIZE * JS_LIMB_BITS)
+
+            exponent_value = exponent->tab[0];
+
+            total_shift =
+                (uint64_t)exponent_value *
+                log_value;
+
+            if (total_shift >
+                JS_BIGINT_MAX_SIZE *
+                    JS_LIMB_BITS) {
                 goto overflow;
-            e = e1;
-            if (is_neg)
-                is_neg = b->tab[0] & 1;
-            r = js_bigint_new(ctx,
-                              (e + JS_LIMB_BITS + 1 - is_neg) / JS_LIMB_BITS);
-            if (!r)
+            }
+
+            exponent_value = total_shift;
+
+            if (base_is_negative) {
+                base_is_negative =
+                    exponent->tab[0] & 1;
+            }
+
+            result = js_bigint_new(
+                ctx,
+                (exponent_value +
+                 JS_LIMB_BITS +
+                 1 -
+                 base_is_negative) /
+                    JS_LIMB_BITS
+            );
+
+            if (!result)
                 return NULL;
-            memset(r->tab, 0, sizeof(r->tab[0]) * r->len);
-            r->tab[e / JS_LIMB_BITS] =
-                (js_limb_t)(1 - 2 * is_neg) << (e % JS_LIMB_BITS);
-            return r;
+
+            memset(
+                result->tab,
+                0,
+                sizeof(result->tab[0]) *
+                    result->len
+            );
+
+            result->tab[
+                exponent_value /
+                JS_LIMB_BITS
+            ] =
+                (js_limb_t)(
+                    1 - 2 * base_is_negative
+                )
+                << (
+                    exponent_value %
+                    JS_LIMB_BITS
+                );
+
+            return result;
         }
     }
-    if (b->len > 1)
-        goto overflow;
-    if (b->tab[0] > INT32_MAX)
-        goto overflow;
-    e = b->tab[0];
-    n_bits = 32 - clz32(e);
 
-    r = js_bigint_new(ctx, a->len);
-    if (!r)
+    if (exponent->len > 1)
+        goto overflow;
+
+    if (exponent->tab[0] > INT32_MAX)
+        goto overflow;
+
+    exponent_value = exponent->tab[0];
+
+    bit_count =
+        32 - clz32(exponent_value);
+
+    result = js_bigint_new(
+        ctx,
+        base->len
+    );
+
+    if (!result)
         return NULL;
-    memcpy(r->tab, a->tab, a->len * sizeof(a->tab[0]));
-    for(i = n_bits - 2; i >= 0; i--) {
-        r1 = js_bigint_mul(ctx, r, r);
-        if (!r1)
+
+    memcpy(
+        result->tab,
+        base->tab,
+        base->len *
+            sizeof(base->tab[0])
+    );
+
+    for (bit_index = bit_count - 2;
+         bit_index >= 0;
+         bit_index--) {
+        next_result =
+            js_bigint_mul(
+                ctx,
+                result,
+                result
+            );
+
+        if (!next_result)
             return NULL;
-        js_free(ctx, r);
-        r = r1;
-        if ((e >> i) & 1) {
-            r1 = js_bigint_mul(ctx, r, a);
-            if (!r1)
+
+        js_free(ctx, result);
+
+        result = next_result;
+
+        if ((exponent_value >>
+             bit_index) &
+            1) {
+            next_result =
+                js_bigint_mul(
+                    ctx,
+                    result,
+                    base
+                );
+
+            if (!next_result)
                 return NULL;
-            js_free(ctx, r);
-            r = r1;
+
+            js_free(ctx, result);
+
+            result = next_result;
         }
     }
-    return r;
- overflow:
-    JS_ThrowRangeError(ctx, "BigInt is too large");
+
+    return result;
+
+overflow:
+    JS_ThrowRangeError(
+        ctx,
+        "BigInt is too large"
+    );
+
     return NULL;
 }
 
-/* return (mant, exp) so that abs(a) ~ mant*2^(exp - (limb_bits -
-   1). a must be != 0. */
 static uint64_t js_bigint_get_mant_exp(JSContext *ctx,
-                                       int *pexp, const JSBigInt *a)
+                                       int *exp_out,
+                                       const JSBigInt *value)
 {
-    js_limb_t t[4 - JS_LIMB_BITS / 32], carry, v, low_bits;
-    int n1, n2, sgn, shift, i, j, e;
-    uint64_t a1, a0;
+    js_limb_t high_parts[
+        4 - JS_LIMB_BITS / 32
+    ];
+    js_limb_t carry;
+    js_limb_t current;
+    js_limb_t low_nonzero;
 
-    n2 = 4 - JS_LIMB_BITS / 32;
-    n1 = a->len - n2;
-    sgn = js_bigint_sign(a);
+    int lower_count;
+    int high_count;
+    int sign;
+    int shift_count;
+    int idx;
+    int high_idx;
+    int exponent_value;
 
-    /* low_bits != 0 if there are a non zero low bit in abs(a) */
-    low_bits = 0;
-    carry = sgn;
-    for(i = 0; i < n1; i++) {
-        v = (a->tab[i] ^ (-sgn)) + carry;
-        carry = v < carry;
-        low_bits |= v;
+    uint64_t high_value;
+    uint64_t low_value;
+
+    high_count =
+        4 - JS_LIMB_BITS / 32;
+
+    lower_count =
+        value->len - high_count;
+
+    sign = js_bigint_sign(value);
+
+    low_nonzero = 0;
+    carry = sign;
+
+    for (idx = 0;
+         idx < lower_count;
+         idx++) {
+        current =
+            (value->tab[idx] ^ (-sign)) +
+            carry;
+
+        carry = current < carry;
+
+        low_nonzero |= current;
     }
-    /* get the n2 high limbs of abs(a) */
-    for(j = 0; j < n2; j++) {
-        i = j + n1;
-        if (i < 0) {
-            v = 0;
+
+    for (high_idx = 0;
+         high_idx < high_count;
+         high_idx++) {
+        idx = high_idx + lower_count;
+
+        if (idx < 0) {
+            current = 0;
         } else {
-            v = (a->tab[i] ^ (-sgn)) + carry;
-            carry = v < carry;
+            current =
+                (value->tab[idx] ^ (-sign)) +
+                carry;
+
+            carry = current < carry;
         }
-        t[j] = v;
+
+        high_parts[high_idx] = current;
     }
-    
+
 #if JS_LIMB_BITS == 32
-    a1 = ((uint64_t)t[2] << 32) | t[1];
-    a0 = (uint64_t)t[0] << 32;
+    high_value =
+        ((uint64_t)high_parts[2] << 32) |
+        high_parts[1];
+
+    low_value =
+        (uint64_t)high_parts[0] << 32;
 #else
-    a1 = t[1];
-    a0 = t[0];
+    high_value = high_parts[1];
+    low_value = high_parts[0];
 #endif
-    a0 |= (low_bits != 0);
-    /* normalize */
-    if (a1 == 0) {
-        /* JS_LIMB_BITS = 64 bit only */
-        shift = 64;
-        a1 = a0;
-        a0 = 0;
+
+    low_value |= (low_nonzero != 0);
+
+    if (high_value == 0) {
+        shift_count = 64;
+        high_value = low_value;
+        low_value = 0;
     } else {
-        shift = clz64(a1);
-        if (shift != 0) {
-            a1 = (a1 << shift) | (a0 >> (64 - shift));
-            a0 <<= shift;
+        shift_count = clz64(high_value);
+
+        if (shift_count != 0) {
+            high_value =
+                (high_value << shift_count) |
+                (low_value >>
+                 (64 - shift_count));
+
+            low_value <<= shift_count;
         }
     }
-    a1 |= (a0 != 0); /* keep the bits for the final rounding */
-    /* compute the exponent */
-    e = a->len * JS_LIMB_BITS - shift - 1;
-    *pexp = e;
-    return a1;
+
+    high_value |= (low_value != 0);
+
+    exponent_value =
+        value->len *
+            JS_LIMB_BITS -
+        shift_count -
+        1;
+
+    *exp_out = exponent_value;
+
+    return high_value;
 }
 
-/* shift left with round to nearest, ties to even. n >= 1 */
-static uint64_t shr_rndn(uint64_t a, int n)
+static uint64_t shr_rndn(uint64_t value,
+                         int shift_count)
 {
-    uint64_t addend = ((a >> n) & 1) + ((1 << (n - 1)) - 1);
-    return (a + addend) >> n;
+    uint64_t rounding_value;
+
+    rounding_value =
+        ((value >> shift_count) & 1) +
+        ((1 << (shift_count - 1)) - 1);
+
+    return (
+        value + rounding_value
+    ) >> shift_count;
 }
 
-/* convert to float64 with round to nearest, ties to even. Return
-   +/-infinity if too large. */
-static double js_bigint_to_float64(JSContext *ctx, const JSBigInt *a)
+static double js_bigint_to_float64(JSContext *ctx,
+                                   const JSBigInt *value)
 {
-    int sgn, e;
-    uint64_t mant;
+    int sign;
+    int exponent_value;
+    uint64_t mantissa;
 
-    if (a->len == 1) {
-        /* fast case, including zero */
-        return (double)(js_slimb_t)a->tab[0];
+    if (value->len == 1) {
+        return (double)(
+            (js_slimb_t)value->tab[0]
+        );
     }
 
-    sgn = js_bigint_sign(a);
-    mant = js_bigint_get_mant_exp(ctx, &e, a);
-    if (e > 1023) {
-        /* overflow: return infinity */
-        mant = 0;
-        e = 1024;
+    sign = js_bigint_sign(value);
+
+    mantissa =
+        js_bigint_get_mant_exp(
+            ctx,
+            &exponent_value,
+            value
+        );
+
+    if (exponent_value > 1023) {
+        mantissa = 0;
+        exponent_value = 1024;
     } else {
-        mant = (mant >> 1) | (mant & 1); /* avoid overflow in rounding */
-        mant = shr_rndn(mant, 10);
-        /* rounding can cause an overflow */
-        if (mant >= ((uint64_t)1 << 53)) {
-            mant >>= 1;
-            e++;
+        mantissa =
+            (mantissa >> 1) |
+            (mantissa & 1);
+
+        mantissa =
+            shr_rndn(
+                mantissa,
+                10
+            );
+
+        if (mantissa >=
+            ((uint64_t)1 << 53)) {
+            mantissa >>= 1;
+            exponent_value++;
         }
-        mant &= (((uint64_t)1 << 52) - 1);
+
+        mantissa &=
+            (((uint64_t)1 << 52) - 1);
     }
-    return uint64_as_float64(((uint64_t)sgn << 63) |
-                             ((uint64_t)(e + 1023) << 52) |
-                             mant);
+
+    return uint64_as_float64(
+        ((uint64_t)sign << 63) |
+        ((uint64_t)(
+            exponent_value + 1023
+        ) << 52) |
+        mantissa
+    );
 }
 
-/* return (1, NULL) if not an integer, (2, NULL) if NaN or Infinity,
-   (0, n) if an integer, (0, NULL) in case of memory error */
-static JSBigInt *js_bigint_from_float64(JSContext *ctx, int *pres, double a1)
+static JSBigInt *js_bigint_from_float64(JSContext *ctx,
+                                        int *result_code,
+                                        double input_value)
 {
-    uint64_t a = float64_as_uint64(a1);
-    int sgn, e, shift;
-    uint64_t mant;
-    JSBigIntBuf buf;
-    JSBigInt *r;
-    
-    sgn = a >> 63;
-    e = (a >> 52) & ((1 << 11) - 1);
-    mant = a & (((uint64_t)1 << 52) - 1);
-    if (e == 2047) {
-        /* NaN, Infinity */
-        *pres = 2;
+    uint64_t raw_value =
+        float64_as_uint64(input_value);
+
+    int sign;
+    int exponent_value;
+    int shift_count;
+
+    uint64_t mantissa;
+
+    JSBigIntBuf temp_buffer;
+    JSBigInt *result;
+
+    sign = raw_value >> 63;
+
+    exponent_value =
+        (raw_value >> 52) &
+        ((1 << 11) - 1);
+
+    mantissa =
+        raw_value &
+        (((uint64_t)1 << 52) - 1);
+
+    if (exponent_value == 2047) {
+        *result_code = 2;
         return NULL;
     }
-    if (e == 0 && mant == 0) {
-        /* zero */
-        *pres = 0;
-        return js_bigint_new_si(ctx, 0);
+
+    if (exponent_value == 0 &&
+        mantissa == 0) {
+        *result_code = 0;
+
+        return js_bigint_new_si(
+            ctx,
+            0
+        );
     }
-    e -= 1023;
-    /* 0 < a < 1 : not an integer */
-    if (e < 0)
-        goto not_an_integer;
-    mant |= (uint64_t)1 << 52;
-    if (e < 52) {
-        shift = 52 - e;
-        /* check that there is no fractional part */
-        if (mant & (((uint64_t)1 << shift) - 1)) {
-        not_an_integer:
-            *pres = 1;
+
+    exponent_value -= 1023;
+
+    if (exponent_value < 0)
+        goto non_integer;
+
+    mantissa |=
+        (uint64_t)1 << 52;
+
+    if (exponent_value < 52) {
+        shift_count =
+            52 - exponent_value;
+
+        if (mantissa &
+            (((uint64_t)1 <<
+              shift_count) - 1)) {
+
+non_integer:
+            *result_code = 1;
             return NULL;
         }
-        mant >>= shift;
-        e = 0;
+
+        mantissa >>= shift_count;
+        exponent_value = 0;
     } else {
-        e -= 52;
+        exponent_value -= 52;
     }
-    if (sgn)
-        mant = -mant;
-    /* the integer is mant*2^e */
-    r = js_bigint_set_si64(&buf, (int64_t)mant);
-    *pres = 0;
-    return js_bigint_shl(ctx, r, e);
+
+    if (sign) {
+        mantissa = -mantissa;
+    }
+
+    result =
+        js_bigint_set_si64(
+            &temp_buffer,
+            (int64_t)mantissa
+        );
+
+    *result_code = 0;
+
+    return js_bigint_shl(
+        ctx,
+        result,
+        exponent_value
+    );
 }
 
-/* return -1, 0, 1 or (2) (unordered) */
-static int js_bigint_float64_cmp(JSContext *ctx, const JSBigInt *a,
-                                 double b)
+static int js_bigint_float64_cmp(JSContext *ctx,
+                                 const JSBigInt *lhs,
+                                 double rhs)
 {
-    int b_sign, a_sign, e, f;
-    uint64_t mant, b1, a_mant;
-    
-    b1 = float64_as_uint64(b);
-    b_sign = b1 >> 63;
-    e = (b1 >> 52) & ((1 << 11) - 1);
-    mant = b1 & (((uint64_t)1 << 52) - 1);
-    a_sign = js_bigint_sign(a);
-    if (e == 2047) {
-        if (mant != 0) {
-            /* NaN */
+    int rhs_sign;
+    int lhs_sign;
+    int exponent_value;
+    int lhs_exponent;
+
+    uint64_t mantissa;
+    uint64_t raw_rhs;
+    uint64_t lhs_mantissa;
+
+    raw_rhs =
+        float64_as_uint64(rhs);
+
+    rhs_sign =
+        raw_rhs >> 63;
+
+    exponent_value =
+        (raw_rhs >> 52) &
+        ((1 << 11) - 1);
+
+    mantissa =
+        raw_rhs &
+        (((uint64_t)1 << 52) - 1);
+
+    lhs_sign =
+        js_bigint_sign(lhs);
+
+    if (exponent_value == 2047) {
+        if (mantissa != 0) {
             return 2;
         } else {
-            /* +/- infinity */
-            return 2 * b_sign - 1;
+            return 2 * rhs_sign - 1;
         }
-    } else if (e == 0 && mant == 0) {
-        /* b = +/-0 */
-        if (a->len == 1 && a->tab[0] == 0)
+    } else if (exponent_value == 0 &&
+               mantissa == 0) {
+
+        if (lhs->len == 1 &&
+            lhs->tab[0] == 0) {
             return 0;
-        else
-            return 1 - 2 * a_sign;
-    } else if (a->len == 1 && a->tab[0] == 0) {
-        /* a = 0, b != 0 */
-        return 2 * b_sign - 1;
-    } else if (a_sign != b_sign) {
-        return 1 - 2 * a_sign;
-    } else {
-        e -= 1023;
-        /* Note: handling denormals is not necessary because we
-           compare to integers hence f >= 0 */
-        /* compute f so that 2^f <= abs(a) < 2^(f+1) */
-        a_mant = js_bigint_get_mant_exp(ctx, &f, a);
-        if (f != e) {
-            if (f < e)
-                return -1;
-            else
-                return 1;
         } else {
-            mant = (mant | ((uint64_t)1 << 52)) << 11; /* align to a_mant */
-            if (a_mant < mant)
-                return 2 * a_sign - 1;
-            else if (a_mant > mant)
-                return 1 - 2 * a_sign;
-            else
+            return 1 - 2 * lhs_sign;
+        }
+
+    } else if (lhs->len == 1 &&
+               lhs->tab[0] == 0) {
+
+        return 2 * rhs_sign - 1;
+
+    } else if (lhs_sign != rhs_sign) {
+
+        return 1 - 2 * lhs_sign;
+
+    } else {
+        exponent_value -= 1023;
+
+        lhs_mantissa =
+            js_bigint_get_mant_exp(
+                ctx,
+                &lhs_exponent,
+                lhs
+            );
+
+        if (lhs_exponent !=
+            exponent_value) {
+
+            if (lhs_exponent <
+                exponent_value) {
+                return -1;
+            } else {
+                return 1;
+            }
+
+        } else {
+            mantissa =
+                (mantissa |
+                 ((uint64_t)1 << 52))
+                << 11;
+
+            if (lhs_mantissa < mantissa) {
+                return 2 * lhs_sign - 1;
+            } else if (lhs_mantissa >
+                       mantissa) {
+                return 1 - 2 * lhs_sign;
+            } else {
                 return 0;
+            }
         }
     }
 }
 
-/* return -1, 0 or 1 */
+#define CMP_BUF_MAX_LIMBS (JS_BIGINT_MAX_SIZE -1)
 static int js_bigint_cmp(JSContext *ctx, const JSBigInt *a,
                          const JSBigInt *b)
 {
+    int len_a = a->len;
+    int len_b = b->len;
     int a_sign, b_sign, res, i;
+
+    js_limb_t a_cmp_buf[CMP_BUF_MAX_LIMBS];
+    js_limb_t b_cmp_buf[CMP_BUF_MAX_LIMBS];
+
+    memcpy(a_cmp_buf, a->tab, (size_t)len_a * sizeof(js_limb_t));
+    memcpy(b_cmp_buf, b->tab, (size_t)len_b * sizeof(js_limb_t));
+
     a_sign = js_bigint_sign(a);
     b_sign = js_bigint_sign(b);
     if (a_sign != b_sign) {
         res = 1 - 2 * a_sign;
     } else {
         /* we assume the numbers are normalized */
-        if (a->len != b->len) {
-            if (a->len < b->len)
+        if (len_a != len_b) {
+            if (len_a < len_b)
                 res = 2 * a_sign - 1;
             else
                 res = 1 - 2 * a_sign;
         } else {
             res = 0;
-            for(i = a->len -1; i >= 0; i--) {
-                if (a->tab[i] != b->tab[i]) {
-                    if (a->tab[i] < b->tab[i])
+            for (i = len_a - 1; i >= 0; i--) {
+                if (a_cmp_buf[i] != b_cmp_buf[i]) {
+                    if (a_cmp_buf[i] < b_cmp_buf[i])
                         res = -1;
                     else
                         res = 1;
@@ -12018,8 +12524,9 @@ static int js_bigint_cmp(JSContext *ctx, const JSBigInt *a,
     return res;
 }
 
-/* contains 10^i */
-static const js_limb_t js_pow_dec[JS_LIMB_DIGITS + 1] = {
+static const js_limb_t js_pow_dec[
+    JS_LIMB_DIGITS + 1
+] = {
     1U,
     10U,
     100U,
@@ -12044,102 +12551,235 @@ static const js_limb_t js_pow_dec[JS_LIMB_DIGITS + 1] = {
 #endif
 };
 
-/* syntax: [-]digits in base radix. Return NULL if memory error. radix
-   = 10, 2, 8 or 16. */
 static JSBigInt *js_bigint_from_string(JSContext *ctx,
-                                       const char *str, int radix)
+                                       const char *input,
+                                       int radix)
 {
-    const char *p = str;
-    size_t n_digits1;
-    int is_neg, n_digits, n_limbs, len, log2_radix, n_bits, i;
-    JSBigInt *r;
-    js_limb_t v, c, h;
-    
-    is_neg = 0;
-    if (*p == '-') {
-        is_neg = 1;
-        p++;
+    const char *cursor = input;
+
+    size_t digit_count_size;
+
+    int negative;
+    int digit_count;
+    int limb_count;
+    int used_len;
+    int bits_per_digit;
+    int bit_count;
+    int idx;
+
+    JSBigInt *result;
+
+    js_limb_t value;
+    js_limb_t digit;
+    js_limb_t high_limb;
+
+    negative = 0;
+
+    if (*cursor == '-') {
+        negative = 1;
+        cursor++;
     }
-    while (*p == '0')
-        p++;
-    n_digits1 = strlen(p);
-    /* the real check for overflox is done js_bigint_new(). Here
-       we just avoid integer overflow */
-    if (n_digits1 > JS_BIGINT_MAX_SIZE * JS_LIMB_BITS) {
-        JS_ThrowRangeError(ctx, "BigInt is too large to allocate");
+
+    while (*cursor == '0') {
+        cursor++;
+    }
+
+    digit_count_size =
+        strlen(cursor);
+
+    if (digit_count_size >
+        JS_BIGINT_MAX_SIZE *
+            JS_LIMB_BITS) {
+
+        JS_ThrowRangeError(
+            ctx,
+            "BigInt is too large to allocate"
+        );
+
         return NULL;
     }
-    n_digits = n_digits1;
-    log2_radix = 32 - clz32(radix - 1); /* ceil(log2(radix)) */
-    /* compute the maximum number of limbs */
+
+    digit_count =
+        digit_count_size;
+
+    bits_per_digit =
+        32 - clz32(radix - 1);
+
     if (radix == 10) {
-        n_bits = (n_digits * 27 + 7) / 8; /* >= ceil(n_digits * log2(10)) */
+        bit_count =
+            (digit_count * 27 + 7) / 8;
     } else {
-        n_bits = n_digits * log2_radix;
+        bit_count =
+            digit_count *
+            bits_per_digit;
     }
-    /* we add one extra bit for the sign */
-    n_limbs = max_int(1, n_bits / JS_LIMB_BITS + 1);
-    r = js_bigint_new(ctx, n_limbs);
-    if (!r)
+
+    limb_count =
+        max_int(
+            1,
+            bit_count /
+                JS_LIMB_BITS +
+                1
+        );
+
+    result =
+        js_bigint_new(
+            ctx,
+            limb_count
+        );
+
+    if (!result)
         return NULL;
+
     if (radix == 10) {
-        int digits_per_limb = JS_LIMB_DIGITS;
-        len = 1;
-        r->tab[0] = 0;
-        for(;;) {
-            /* XXX: slow */
-            v = 0;
-            for(i = 0; i < digits_per_limb; i++) {
-                c = to_digit(*p);
-                if (c >= radix)
+        int digits_per_limb =
+            JS_LIMB_DIGITS;
+
+        used_len = 1;
+        result->tab[0] = 0;
+
+        for (;;) {
+            value = 0;
+
+            for (idx = 0;
+                 idx < digits_per_limb;
+                 idx++) {
+
+                digit =
+                    to_digit(*cursor);
+
+                if (digit >= radix)
                     break;
-                p++;
-                v = v * 10 + c;
+
+                cursor++;
+
+                value =
+                    value * 10 +
+                    digit;
             }
-            if (i == 0)
+
+            if (idx == 0)
                 break;
-            if (len == 1 && r->tab[0] == 0) {
-                r->tab[0] = v;
+
+            if (used_len == 1 &&
+                result->tab[0] == 0) {
+
+                result->tab[0] =
+                    value;
+
             } else {
-                h = mp_mul1(r->tab, r->tab, len, js_pow_dec[i], v);
-                if (h != 0) {
-                    r->tab[len++] = h;
+                high_limb =
+                    mp_mul1(
+                        result->tab,
+                        result->tab,
+                        used_len,
+                        js_pow_dec[idx],
+                        value
+                    );
+
+                if (high_limb != 0) {
+                    result->tab[
+                        used_len++
+                    ] = high_limb;
                 }
             }
         }
-        /* add one extra limb to have the correct sign*/
-        if ((r->tab[len - 1] >> (JS_LIMB_BITS - 1)) != 0)
-            r->tab[len++] = 0;
-        r->len = len;
+
+        if ((result->tab[
+                 used_len - 1
+             ] >>
+             (JS_LIMB_BITS - 1)) != 0) {
+
+            result->tab[
+                used_len++
+            ] = 0;
+        }
+
+        result->len = used_len;
+
     } else {
-        unsigned int bit_pos, shift, pos;
-        
-        /* power of two base: no multiplication is needed */
-        r->len = n_limbs;
-        memset(r->tab, 0, sizeof(r->tab[0]) * n_limbs);
-        for(i = 0; i < n_digits; i++) {
-            c = to_digit(p[n_digits - 1 - i]);
-            assert(c < radix);
-            bit_pos = i * log2_radix;
-            shift = bit_pos & (JS_LIMB_BITS - 1);
-            pos = bit_pos / JS_LIMB_BITS;
-            r->tab[pos] |= c << shift;
-            /* if log2_radix does not divide JS_LIMB_BITS, needed an
-               additional op */
-            if (shift + log2_radix > JS_LIMB_BITS) {
-                r->tab[pos + 1] |= c >> (JS_LIMB_BITS - shift);
+        unsigned int bit_position;
+        unsigned int bit_shift;
+        unsigned int limb_position;
+
+        result->len = limb_count;
+
+        memset(
+            result->tab,
+            0,
+            sizeof(result->tab[0]) *
+                limb_count
+        );
+
+        for (idx = 0;
+             idx < digit_count;
+             idx++) {
+
+            digit =
+                to_digit(
+                    cursor[
+                        digit_count -
+                        1 -
+                        idx
+                    ]
+                );
+
+            assert(digit < radix);
+
+            bit_position =
+                idx * bits_per_digit;
+
+            bit_shift =
+                bit_position &
+                (JS_LIMB_BITS - 1);
+
+            limb_position =
+                bit_position /
+                JS_LIMB_BITS;
+
+            result->tab[
+                limb_position
+            ] |=
+                digit <<
+                bit_shift;
+
+            if (bit_shift +
+                    bits_per_digit >
+                JS_LIMB_BITS) {
+
+                result->tab[
+                    limb_position + 1
+                ] |=
+                    digit >>
+                    (
+                        JS_LIMB_BITS -
+                        bit_shift
+                    );
             }
         }
     }
-    r = js_bigint_normalize(ctx, r);
-    /* XXX: could do it in place */
-    if (is_neg) {
-        JSBigInt *r1;
-        r1 = js_bigint_neg(ctx, r);
-        js_free(ctx, r);
-        r = r1;
+
+    result =
+        js_bigint_normalize(
+            ctx,
+            result
+        );
+
+    if (negative) {
+        JSBigInt *negated_result;
+
+        negated_result =
+            js_bigint_neg(
+                ctx,
+                result
+            );
+
+        js_free(ctx, result);
+
+        result = negated_result;
     }
-    return r;
+
+    return result;
 }
 
 /* 2 <= base <= 36 */
